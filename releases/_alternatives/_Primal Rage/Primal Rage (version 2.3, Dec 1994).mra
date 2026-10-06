@@ -103,5 +103,5 @@
 
 	<nvram index="4" size="2048"/>
 
-	<buttons names="High Quick,High Fierce,Low Quick,Low Fierce,Coin,Start" default="Y,X,B,A,Select,Start"/>
+	<buttons names="High Quick,High Fierce,Low Quick,Low Fierce,Coin" default="Y,X,B,A,Select"/>
 </misterromdescription>
