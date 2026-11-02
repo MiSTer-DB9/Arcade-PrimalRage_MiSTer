@@ -20,7 +20,8 @@
 //
 // Pixel pipeline latency: 4 ce_pix cycles from address issue (hcnt_raw) to
 // the registered r/g/b output (line-buffer read, mux the two buffers' reads,
-// cram lookup, mram lookup + white override -> one ce_pix cycle each). The
+// cram lookup, mram lookup + lightning or white override -> one ce_pix cycle
+// each). The
 // line-buffer read and the buf0/buf1 select are two separate stages so each
 // array read stays a plain `q <= mem[addr]` with nothing else on the RHS
 // (Quartus needs that shape to infer M10K; a muxed read like
@@ -352,7 +353,8 @@ module atarigt_video (
 
 	// ------------------------------------------------------------------
 	// Line buffers: PF (14 bit, keeps the arithmetic-overflow bit used by
-	// the white override) and AN (8 bit), two buffers ping-ponged per line.
+	// the lightning gate and the T-MEK white override) and AN (8 bit), two
+	// buffers ping-ponged per line.
 	// ------------------------------------------------------------------
 	(* ramstyle = "M10K" *) reg [13:0] pf_buf0 [0:335];
 	(* ramstyle = "M10K" *) reg [13:0] pf_buf1 [0:335];
@@ -666,7 +668,7 @@ module atarigt_video (
 
 	// ------------------------------------------------------------------
 	// Display / mixer pipeline (4 ce_pix cycles: line-buffer read, buf0/buf1
-	// select, cram lookup, mram lookup + white override -> registered r/g/b)
+	// select, cram lookup, mram lookup + lightning/white override -> registered r/g/b)
 	// ------------------------------------------------------------------
 	// fb_rd_x/y must be registered (gated by ce_pix, using the same pre-edge
 	// hcnt_raw/vcnt_raw as the buffer reads below) rather than a
@@ -744,6 +746,11 @@ module atarigt_video (
 						   mo_wins  ? {2'b10, mo_d1[10:0]} :
 									  {1'b0, pf_s1[11:0]};
 
+	// alpha is not exempt, unlike upstream MAME: on the PCB text over far PF
+	// pales at LCR 3 and vanishes at LCR 1, text over an MO keeps its colour
+	wire [2:0] lcr    = color_latch[2:0];
+	wire       far_on = !mo_wins && ((pf_s1[5:0] == 6'b0) || !pf_s1[13]);
+
 	// T-Mek branch of screen_update: same mgep/an_opaque, but the MO-wins
 	// test drops PR's MVID11 (mo_d1[11]) override, and cra/tra both come
 	// from the same 3-way pick (alpha, mo, pf)
@@ -770,10 +777,13 @@ module atarigt_video (
 	// alongside them
 	reg [13:0] pf_s2;
 	reg        de_s2;
+	reg        fx_black_s2, fx_wash_s2;
 	always @(posedge clk) begin
 		if (ce_pix) begin
 			pf_s2 <= pf_s1;
 			de_s2 <= de_s1;
+			fx_black_s2 <= !tmek && ((lcr == 3'd2) || (lcr == 3'd1 && far_on));
+			fx_wash_s2  <= !tmek && (lcr[2] || (lcr == 3'd3 && far_on));
 		end
 	end
 
@@ -802,14 +812,40 @@ module atarigt_video (
 	wire white_ov = (color_latch[2:0] != 3'b0) &&
 					((pf_s2[5:0] == 6'b0) || (pf_s2[13] == 1'b0));
 
+	function automatic [7:0] third;
+		input [7:0] v;
+		reg [15:0] p;
+		begin
+			p = {8'h00, v} * 16'd171;
+			third = {1'b0, p[15:9]};
+		end
+	endfunction
+
+	// free-running on clk, no ce_pix: the MRAM read and the /3 each get their
+	// own clock inside one pixel, so stage 4 only sees a settled flop
+	reg [7:0] mix_r_q, mix_g_q, mix_b_q;
+	reg [7:0] wash_r_q, wash_g_q, wash_b_q;
+	always @(posedge clk) begin
+		mix_r_q  <= mix_r;
+		mix_g_q  <= mix_g;
+		mix_b_q  <= mix_b;
+		wash_r_q <= third(mix_r_q) + 8'd149;
+		wash_g_q <= third(mix_g_q) + 8'd163;
+		wash_b_q <= third(mix_b_q) + 8'd144;
+	end
+
 	// stage 4: final registered output
 	reg [7:0] r_r, g_r, b_r;
 	always @(posedge clk) begin
 		if (ce_pix) begin
 			if (!de_s2) begin
 				r_r <= 8'h00; g_r <= 8'h00; b_r <= 8'h00;
-			end else if (white_ov) begin
+			end else if (tmek && white_ov) begin
 				r_r <= 8'hff; g_r <= 8'hff; b_r <= 8'hff;
+			end else if (fx_black_s2) begin
+				r_r <= 8'h00; g_r <= 8'h00; b_r <= 8'h00;
+			end else if (fx_wash_s2) begin
+				r_r <= wash_r_q; g_r <= wash_g_q; b_r <= wash_b_q;
 			end else begin
 				r_r <= mix_r; g_r <= mix_g; b_r <= mix_b;
 			end

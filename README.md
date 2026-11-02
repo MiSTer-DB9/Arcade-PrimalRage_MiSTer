@@ -164,7 +164,7 @@ Some AI tools were used during development. All code went through human review. 
 3. The bitstream is written to `output_files/Arcade-PrimalRage.rbf`. A full build takes about 30 minutes.
 4. `clean.bat` removes the build outputs.
 
-The design is large: about 72% of the logic and 522 of 553 M10K blocks. The release build uses fitter seed 9 (`SEED` in `Arcade-PrimalRage.qsf`). It misses setup by 0.033 ns on one SDRAM to CPU path in the slow 100C corner only and was checked on the board with every set. Other seeds or code changes can move the slack by a few hundred picoseconds, so check the timing report after each build and try another seed if a clock fails.
+The design is large: about 72% of the logic and 526 of 553 M10K blocks. The release build uses fitter seed 5 (`SEED` in `Arcade-PrimalRage.qsf`). It meets setup and hold on every clock, worst setup +0.158 ns, and was checked on the board with every set. Other seeds or code changes can move the slack by a few hundred picoseconds, so check the timing report after each build and try another seed if a clock fails.
 
 ---
 
