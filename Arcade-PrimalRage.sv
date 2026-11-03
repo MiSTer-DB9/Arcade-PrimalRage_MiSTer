@@ -521,6 +521,9 @@ rom_ddr_replay rom_ddr_replay
 
 // ddr_lat_meter words (see below the ddr_arbiter)
 wire [63:0] lat_win, lat_max;
+`ifdef DDR_LAT_DIAG
+wire [63:0] race_win, race_max;
+`endif
 
 rom_loader rom_loader
 (
@@ -560,6 +563,10 @@ rom_loader rom_loader
 	.loader_sel_in(loader_sel),
 	.ddr_busy_in(DDRAM_BUSY),
 	.dsp_we_count_in(cage_dsp_we_count),
+`ifdef DDR_LAT_DIAG
+	.race_win(race_win),
+	.race_max(race_max),
+`endif
 	.lat_win(lat_win),
 	.lat_max(lat_max)
 );
@@ -952,6 +959,7 @@ atarigt_video atarigt_video
 );
 
 wire [7:0] mo_next_line = (vcnt >= 9'd261) ? 8'd0 : vcnt[7:0] + 8'd1;
+wire rle_draw_busy;
 
 rle_objects rle_objects
 (
@@ -991,8 +999,26 @@ rle_objects rle_objects
 	.ddr_busy(rle_ddr_busy),
 
 	.prescan_start(prescan_start),
-	.prescan_done(prescan_done)
+	.prescan_done(prescan_done),
+	.draw_busy(rle_draw_busy)
 );
+
+// DDR_LAT_DIAG: object RAM writes and control edges during a draw, debug qwords
+// 7/8 (0x33000038, 0x33000040). clk_cpu control is sampled on clk_sys as in rle_objects
+`ifdef DDR_LAT_DIAG
+rle_race_meter rle_race_meter
+(
+	.clk(clk_sys),
+	.clk_cpu(clk_cpu),
+	.reset(~pll_locked),
+	.draw_busy(rle_draw_busy),
+	.control(mo_control),
+	.oram_wr(|oram_we),
+	.vblank_rise(vblank_rise),
+	.win_q(race_win),
+	.max_q(race_max)
+);
+`endif
 
 ///////////////////////   INPUTS   ///////////////////////////////
 
@@ -1171,8 +1197,8 @@ endmodule
 // Debug block: does not depend on download_end (that trigger was lost
 // on the board), so it fires periodically (every 2^25 clk_sys cycles)
 // and also once on a download-end edge, writing six qwords to DDR3
-// 0x33000000. Kept as board diagnostics (devmem), six DDR3 writes per
-// ~0.4 s. q4 bits [31:16] of its low word carry the DSP host-latch
+// 0x33000000. Kept as board diagnostics (devmem), six DDR3 writes (nine with
+// DDR_LAT_DIAG) per ~0.4 s. q4 bits [31:16] of its low word carry the DSP host-latch
 // write counter.
 // ---------------------------------------------------------------------
 module rom_loader
@@ -1214,6 +1240,10 @@ module rom_loader
 	input             loader_sel_in,
 	input             ddr_busy_in,
 	input      [15:0] dsp_we_count_in,
+`ifdef DDR_LAT_DIAG
+	input      [63:0] race_win,
+	input      [63:0] race_max,
+`endif
 	// DDR_LAT_DIAG builds only: ddr_lat_meter words for q5/q6
 	input      [63:0] lat_win,
 	input      [63:0] lat_max
@@ -1324,7 +1354,12 @@ reg [25:0] hb_div;
 reg [31:0] heartbeat;
 
 localparam DBG_IDLE=0, DBG_Q0=1, DBG_Q1=2, DBG_Q2=3, DBG_Q3=4, DBG_Q4=5, DBG_Q5=6, DBG_Q6=7;
+`ifdef DDR_LAT_DIAG
+localparam DBG_Q7=8, DBG_Q8=9;
+reg [3:0] dbg_state;
+`else
 reg [2:0] dbg_state;
+`endif
 assign dbg_active = (dbg_state != DBG_IDLE);
 
 reg [24:0] per_cnt;
@@ -1533,7 +1568,23 @@ always @(posedge clk) begin
 					pend_ddr <= 1'b1;
 					dbg_state <= DBG_Q6;
 				end
-				DBG_Q6: dbg_state <= DBG_IDLE;
+				DBG_Q6: begin
+					ddr_addr <= DEBUG_ADDR + 29'd7;
+					ddr_din  <= race_win;
+					ddr_be   <= 8'hff;
+					ddr_we   <= 1'b1;
+					pend_ddr <= 1'b1;
+					dbg_state <= DBG_Q7;
+				end
+				DBG_Q7: begin
+					ddr_addr <= DEBUG_ADDR + 29'd8;
+					ddr_din  <= race_max;
+					ddr_be   <= 8'hff;
+					ddr_we   <= 1'b1;
+					pend_ddr <= 1'b1;
+					dbg_state <= DBG_Q8;
+				end
+				DBG_Q8: dbg_state <= DBG_IDLE;
 `else
 				DBG_Q5: dbg_state <= DBG_IDLE;
 `endif

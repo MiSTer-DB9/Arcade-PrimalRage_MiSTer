@@ -43,7 +43,8 @@ module rle_objects #(
 	output logic [7:0]  ddr_be,
 
 	input               prescan_start,
-	output              prescan_done
+	output              prescan_done,
+	output              draw_busy
 );
 
 	localparam [28:0] ROM_WORD_BASE   = 29'h0600_0000; // byte 0x30000000 >> 3
@@ -154,7 +155,8 @@ module rle_objects #(
 		S_DRAW_ROW_ENTRY_GOT,
 		S_DRAW_PIXEL_LO, S_DRAW_PIXEL_HI,
 		S_DRAW_ROW_NEXT,
-		S_DRAW_OBJ_NEXT
+		S_DRAW_OBJ_NEXT,
+		S_DRAW_COPY_WAIT, S_DRAW_COPY
 	} state_t;
 
 	state_t state, return_state;
@@ -516,6 +518,15 @@ module rle_objects #(
 	logic [7:0]  order_cache_rd_r; // registered read of order_cache for S_DRAW_SORT
 	logic [7:0]  cache_idx;
 	logic [7:0]  order_cnt, objnum_cnt;
+	// the game rewrites object RAM in place during a draw: at tmek=0 the draw
+	// reads an image taken right after MOGO, the way MAME sorts and renders on
+	// that write. T-MEK keeps live reads
+	(* ramstyle = "M10K" *) logic [15:0] oram_shadow [0:2047];
+	logic [15:0] oram_shadow_r;
+	logic [11:0] copy_idx; // bit 11 set: this draw has its image
+	always_ff @(posedge clk) if (state == S_DRAW_COPY) oram_shadow[copy_idx[10:0]] <= oram_i_dout_r;
+	always_ff @(posedge clk) oram_shadow_r <= oram_shadow[oram_i_addr];
+	wire [15:0] oram_draw_r = tmek ? oram_i_dout_r : oram_shadow_r;
 	logic [14:0] code_r;
 	logic        hflip_r, vram_r;
 	logic [7:0]  colour_r;
@@ -562,11 +573,17 @@ module rle_objects #(
 	logic prescan_done_r;
 	assign prescan_done = prescan_done_r;
 
+	// draw only: prescan and cmd 2 never set the flop. S_IDLE is gated out because a
+	// pending MOGO starts the next draw from that one clock, and a MOGO there is not late
+	logic draw_busy_r;
+	assign draw_busy = draw_busy_r & (state != S_IDLE);
+
 	always_ff @(posedge clk) begin
 		if (reset) begin
 			state          <= S_IDLE;
 			rom_line_valid <= 1'b0;
 			prescan_done_r <= 1'b0;
+			draw_busy_r    <= 1'b0;
 			fb_wr_en       <= 1'b0;
 			oram_i_we      <= 1'b0;
 			objectcount_r  <= 24'd0;
@@ -582,6 +599,7 @@ module rle_objects #(
 			case (state)
 			// ----------------------------------------------------------------
 			S_IDLE: begin
+				draw_busy_r <= 1'b0;
 				if (prescan_start && !prescan_done_r) begin
 					// clear the checksum BRAM first (MAME memsets m_checksums
 					// before accumulating; real BRAM power-on content is
@@ -597,8 +615,10 @@ module rle_objects #(
 						oram_i_addr <= 11'd0;
 						state       <= S_CKSUM_READ0;
 					end else begin
+						draw_busy_r <= 1'b1;
 						fb_wr_buf <= ~eff_frame;
 						asm_open  <= 1'b0; // no row carried over from a previous draw
+						copy_idx  <= 12'd0;
 						if (erase_seen | control[1]) begin
 							state <= S_DRAW_ERASE;
 						end else begin
@@ -913,12 +933,17 @@ module rle_objects #(
 			// the order x objnum scan below is a local compare instead of
 			// 65K+ round trips through the object-RAM read port
 			S_DRAW_CACHE_ORDER: begin
-				oram_i_addr <= {cache_idx, 3'd6};
-				state       <= S_DRAW_CACHE_WAIT;
+				if (!tmek && !copy_idx[11]) begin
+					oram_i_addr <= 11'd0;
+					state       <= S_DRAW_COPY_WAIT;
+				end else begin
+					oram_i_addr <= {cache_idx, 3'd6};
+					state       <= S_DRAW_CACHE_WAIT;
+				end
 			end
 			S_DRAW_CACHE_WAIT: state <= S_DRAW_CACHE_GOT;
 			S_DRAW_CACHE_GOT: begin
-				order_cache[cache_idx] <= oram_i_dout_r[7:0];
+				order_cache[cache_idx] <= oram_draw_r[7:0];
 				if (cache_idx == 8'd255) begin
 					order_cnt  <= 8'd1;
 					objnum_cnt <= 8'd255;
@@ -927,6 +952,18 @@ module rle_objects #(
 					cache_idx <= cache_idx + 8'd1;
 					state     <= S_DRAW_CACHE_ORDER;
 				end
+			end
+
+			// one word per clock: oram_i_addr leads copy_idx by the two clocks of a
+			// registered read, so the window for a CPU write stays near 24 us
+			S_DRAW_COPY_WAIT: begin
+				oram_i_addr <= 11'd1;
+				state       <= S_DRAW_COPY;
+			end
+			S_DRAW_COPY: begin
+				oram_i_addr <= oram_i_addr + 11'd1;
+				copy_idx    <= copy_idx + 12'd1;
+				if (copy_idx[10:0] == 11'd2047) state <= S_DRAW_CACHE_ORDER;
 			end
 
 			// the only read of order_cache: a plain registered read for the
@@ -951,20 +988,20 @@ module rle_objects #(
 			S_DRAW_FIELD: state <= S_DRAW_FIELD_GOT;
 			S_DRAW_FIELD_GOT: begin
 				case (field_idx)
-					3'd0: begin code_r <= oram_i_dout_r[14:0]; hflip_r <= oram_i_dout_r[15]; end
+					3'd0: begin code_r <= oram_draw_r[14:0]; hflip_r <= oram_draw_r[15]; end
 					3'd1: begin
-						colour_r   <= oram_i_dout_r[11:4];
-						priority_r <= oram_i_dout_r[11:9];
-						vram_r     <= oram_i_dout_r[15];
+						colour_r   <= oram_draw_r[11:4];
+						priority_r <= oram_draw_r[11:9];
+						vram_r     <= oram_draw_r[15];
 					end
-					3'd2: xpos_r <= oram_i_dout_r[15] ? {8'hff, oram_i_dout_r[15:6]} : {8'h00, oram_i_dout_r[15:6]};
-					3'd3: ypos_r <= oram_i_dout_r[15] ? {8'hff, oram_i_dout_r[15:6]} : {8'h00, oram_i_dout_r[15:6]};
+					3'd2: xpos_r <= oram_draw_r[15] ? {8'hff, oram_draw_r[15:6]} : {8'h00, oram_draw_r[15:6]};
+					3'd3: ypos_r <= oram_draw_r[15] ? {8'hff, oram_draw_r[15:6]} : {8'h00, oram_draw_r[15:6]};
 					default: ; // field 4 (scale) handled below
 				endcase
 
 				if (field_idx == 3'd4) begin
-					scale_r <= oram_i_dout_r;
-					if (oram_i_dout_r == 16'h0 || ({9'h0, code_r} >= objectcount_r) || (vram_r && !tmek)) begin
+					scale_r <= oram_draw_r;
+					if (oram_draw_r == 16'h0 || ({9'h0, code_r} >= objectcount_r) || (vram_r && !tmek)) begin
 						state <= S_DRAW_OBJ_NEXT;
 					end else begin
 						hdr_idx      <= 2'd0;
@@ -1043,7 +1080,8 @@ module rle_objects #(
 
 				scaled_xoffs_r <= hflip_r ? (($signed({1'b0, sw_full_r}) >>> 12) - (sxo_r >>> 12)) : (sxo_r >>> 12);
 				scaled_yoffs_r <= syo_r >>> 12;
-				palettebase_r  <= color_raw & bppmask;
+				// upstream ORs the unmasked base (PR 16305); T-MEK keeps the aligned base, so OR equals its old ADD
+				palettebase_r  <= tmek ? (color_raw & bppmask) : color_raw;
 				state          <= S_DRAW_COMPUTE2;
 			end
 
@@ -1267,7 +1305,7 @@ module rle_objects #(
 				if (sourcex_r < rle_end_r && dx_r != 32'h0) begin
 					if (x_cursor >= 18'sd0 && x_cursor < 18'sd336 && lut_lo[7:0] != 8'h0) begin
 						fb_wr_en   <= 1'b1;
-						fb_wr_data <= {8'h0, lut_lo[7:0]} + palettebase_r;
+						fb_wr_data <= {8'h0, lut_lo[7:0]} | palettebase_r;
 						fb_wr_x    <= x_cursor[8:0];
 					end
 					x_cursor  <= x_cursor + {{15{x_dir[2]}}, x_dir};
@@ -1281,7 +1319,7 @@ module rle_objects #(
 				if (sourcex_r < rle_end_r && dx_r != 32'h0) begin
 					if (x_cursor >= 18'sd0 && x_cursor < 18'sd336 && lut_hi[7:0] != 8'h0) begin
 						fb_wr_en   <= 1'b1;
-						fb_wr_data <= {8'h0, lut_hi[7:0]} + palettebase_r;
+						fb_wr_data <= {8'h0, lut_hi[7:0]} | palettebase_r;
 						fb_wr_x    <= x_cursor[8:0];
 					end
 					x_cursor  <= x_cursor + {{15{x_dir[2]}}, x_dir};
